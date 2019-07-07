@@ -1,5 +1,6 @@
 papers/
 dcgan.py
+models/
 
 .idea/
 notes.txt

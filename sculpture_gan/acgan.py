@@ -7,21 +7,16 @@ Two other implementations that were helpful in constructing this one:
     1. https://github.com/keras-team/keras/blob/master/examples/mnist_acgan.py
     2. https://github.com/eriklindernoren/Keras-GAN/blob/master/acgan/acgan.py
 """
-
-# 1. If you don't want to use plaidml just get rid of these 2 lines
-# 2. If you don't have plaidml set up, follow the installation instructions here - https://github.com/plaidml/plaidml
-import plaidml.keras
-plaidml.keras.install_backend()
-
 import os
-import PIL
 import numpy as np
-from tqdm import trange
+from PIL import Image
+from tqdm import trange, tqdm
 from keras import layers
 from keras.optimizers import Adam
 from keras.models import Sequential, Model
 import warnings
 
+tqdm.monitor_interval = 0
 warnings.simplefilter(action='ignore', category=UserWarning)
 np.random.seed(42)
 
@@ -63,8 +58,6 @@ class Acgan:
         self._test = test_sets
         self._num_test = len(test_sets) if test_sets else 0
 
-        print("Num test", self._num_test)
-
 
     def save_model(self, path=None):
         """
@@ -82,15 +75,18 @@ class Acgan:
         self._combined_model.save(os.path.join(path, "acgan_model.h5"))
 
 
-    def generate_imgs(self, ):
+    def generate_imgs(self, labels):
         """
         Generate a number of images
 
         :param list classes: List containing the numeric indicator for the class to generate
 
-        :return 
+        :return list of PIL objects
         """
-        pass
+        noise = np.random.uniform(-1, 1, (len(labels), self._noise_dim))
+        generated_imgs = self._generator.predict([noise, labels])
+
+        return [Image.fromarray(img) for img in generated_imgs]
 
 
     def _test_discriminator_epoch(self):
@@ -106,13 +102,12 @@ class Acgan:
 
         test_imgs, test_labels = self._get_test_data()
 
-        # TODO: Get test data
         x = np.concatenate((test_imgs, generated_imgs))
 
         y_real = np.array([1] * self._num_test + [0] * self._num_test)
         y_labels = np.concatenate((test_labels, rand_labels))
 
-        test_loss = self._discriminator.evaluate(x, [y_real, y_label], verbose=False)
+        test_loss = self._discriminator.evaluate(x, [y_real, y_labels], verbose=False)
 
         return float(test_loss[0])
 
@@ -130,6 +125,29 @@ class Acgan:
         test_loss = self._combined_model.evaluate([noise, rand_labels], [real, rand_labels], verbose=False)
 
         return float(test_loss[0])
+
+
+    def _test_epoch(self, desc, loss_history):
+        """
+        Test the generator & classifier after an epoch. Only called when data given
+
+        :param desc: Progress bar description
+        :param loss_history: Dict of training/loss info for each epoch
+
+        :return None
+        """
+        # Manually create progress bar
+        pbar = tqdm(total=2, desc=desc)
+
+        loss_history['d_test'] = self._test_discriminator_epoch()
+        pbar.update(1)
+
+        loss_history['g_test'] = self._test_generator_epoch()
+        pbar.update(1)
+
+        print("\nTest Loss:",
+              f"discriminator = {round(loss_history['d_test'], 2)},", 
+              f"generator = {round(loss_history['g_test'], 2)}")
 
 
     def _train_discriminator_batch(self, batch_size):
@@ -214,17 +232,13 @@ class Acgan:
             loss_history['d_train'].append(float(np.mean(np.array(epoch_disc_loss))))
             loss_history['g_train'].append(float(np.mean(np.array(epoch_gen_loss))))
 
-            print(f"\nDisriminator train loss: {loss_history['d_train'][-1]}", end=" ", flush=True)
-            print(f"Generator train loss: {loss_history['g_train'][-1]}", end=" ", flush=True)
+            print("Train Loss:", 
+                  f"discriminator = {round(loss_history['d_train'][-1], 2)},", 
+                  f"generator = {round(loss_history['g_train'][-1], 2)}")
 
-            if self._test:
-                loss_history['d_test'].append(self._test_discriminator_epoch())
-                loss_history['g_test'].append(self._test_generator_epoch())
-
-                print(f"Discriminator test loss: {loss_history['d_test'][-1]}", end=" ", flush=True)
-                print(f"Generator test loss: {loss_history['g_test'][-1]}")
-
-            print("")
+        # Test the data if data was given
+        if self._test:
+            self._test_epoch(f"Testing the model:", loss_history)
 
         return loss_history
 
@@ -416,11 +430,4 @@ class Acgan:
         empty[np.arange(num_labels), np.array(labels)] = 1
 
         return empty
-
-
-
-
-
-
-
 
