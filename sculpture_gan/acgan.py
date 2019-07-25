@@ -16,7 +16,10 @@ from keras import layers
 from keras.optimizers import Adam
 from keras.models import Sequential, Model
 from keras.initializers import RandomNormal
+from keras.layers.noise import GaussianNoise
 import warnings
+
+from .minibatch import MinibatchDiscrimination
 
 tqdm.monitor_interval = 0
 warnings.simplefilter(action='ignore', category=UserWarning)
@@ -24,7 +27,7 @@ np.random.seed(42)
 
 
 class Acgan:
-    def __init__(self, num_classes, train_sets, test_sets=None, input_shape=(128, 128, 3), noise_dim=100, data_gen=True):
+    def __init__(self, num_classes, train_sets, test_sets=None, input_shape=(128, 128, 3), noise_dim=110, data_gen=True):
         """
         :param ImageDataGenerator train_sets: (imgs, labels)
         :param ImageDataGenerator test_sets: (imgs, labels) - If not provided will skip
@@ -41,18 +44,18 @@ class Acgan:
         self._input_shape = input_shape
         self._noise_dim = noise_dim  # Length of initial random vector for generator
 
-        # As noted in paper
-        self._weight_init = RandomNormal(mean=0.0, stddev=0.02)
+        self._weight_init = 'glorot_normal'
 
         # For both the order is - if real and then class
         # Sparse since using integers & not one-hot or not exclusive
         self._loss_function = ['binary_crossentropy', 'sparse_categorical_crossentropy']
 
         # Params noted in paper
-        self._optimizer = Adam(lr=0.0002, beta_1=0.5, beta_2=0.999)
+        self._gen_optimizer = Adam(lr=0.0001, beta_1=0.5, beta_2=0.999)
+        self._disc_optimizer = Adam(lr=0.0004, beta_1=0.5, beta_2=0.999)
 
         # Label smoothing - see here for more https://arxiv.org/pdf/1606.03498.pdf
-        self._label_smoothing = [[0, .1], [.9, 1]]
+        self._label_smoothing = .9
 
         self._generator = self._construct_generator()
         self._discriminator = self._construct_discriminator()
@@ -84,8 +87,8 @@ class Acgan:
 
         # Save all 3 models
         self._generator.save(os.path.join(path, f"acgan_generator{suffix}.h5"))
-        self._discriminator.save(os.path.join(path, f"acgan_discriminator{suffix}.h5"))
-        self._combined_model.save(os.path.join(path, f"acgan_model{suffix}.h5"))
+        #self._discriminator.save(os.path.join(path, f"acgan_discriminator{suffix}.h5"))
+        #self._combined_model.save(os.path.join(path, f"acgan_model{suffix}.h5"))
 
         if loss_history is not None:
             with open(os.path.join(path, f"loss_history{suffix}.json"), "w") as f:
@@ -98,12 +101,12 @@ class Acgan:
 
         :return loss
         """
+        test_imgs, test_labels = self._get_test_data()
+
         # Sample noise & classes as generator input and create new images
-        noise = np.random.normal(0, 1, (self._num_test, self._noise_dim))
+        noise = self._generate_noise(self._num_test)
         rand_labels = np.random.randint(0, self._num_classes, self._num_test)
         generated_imgs = self._generator.predict([noise, rand_labels])
-
-        test_imgs, test_labels = self._get_test_data()
 
         x = np.concatenate((test_imgs, generated_imgs))
 
@@ -121,7 +124,7 @@ class Acgan:
 
         :return loss
         """
-        noise = np.random.normal(0, 1, (2 * self._num_test, self._noise_dim))
+        noise = self._generate_noise(2 * self._num_test)
         rand_labels = np.random.randint(0, self._num_classes, 2 * self._num_test)
         real = np.ones(2 * self._num_test)
 
@@ -140,7 +143,7 @@ class Acgan:
         :return None
         """
         # Manually create progress bar. We'll update it manually
-        pbar = tqdm(total=2, desc="Testing the model:")
+        pbar = tqdm(total=2, desc="Testing the model")
 
         loss_history['d_test'][str(epoch)] = self._test_discriminator_epoch()
         pbar.update(1)
@@ -172,26 +175,33 @@ class Acgan:
         batch_imgs, batch_labels = self._get_batch_data(batch_size, batch_num=batch_num)
 
         # Sample noise & classes as generator input and create new images
-        noise = np.random.normal(0, 1, (batch_size, self._noise_dim))
+        noise = self._generate_noise(batch_size)
         rand_labels = np.random.randint(0, self._num_classes, batch_size)
         generated_imgs = self._generator.predict([noise, rand_labels])
 
         # One sided label-smoothing
         # Also noisy labels
-        real_smooth = self._noisy_labels(np.random.uniform(*self._label_smoothing[1], batch_size))
-        fake_smooth = self._noisy_labels(np.random.uniform(*self._label_smoothing[0], batch_size))
+        y_real = self._noisy_labels(self._label_smoothing * np.ones(batch_size))
+        y_fake = self._noisy_labels(np.zeros(batch_size))
 
-        # Don't have classifier try to learn to classify generated images
-        # To preserve sum the real ones get weighted twice more
-        #real_sample_weight = [np.ones(batch_size), np.ones(batch_size) * 2]
-        #fake_sample_weight = [np.ones(batch_size), np.zeros(batch_size)]
+        #foo = np.concatenate((y_real, y_fake))
+        #bar = np.concatenate((batch_labels, rand_labels))
+        #baz = np.concatenate((batch_imgs, generated_imgs))
 
         # Train generated & real separately 
-        real_loss = self._discriminator.train_on_batch(batch_imgs, [real_smooth, batch_labels])
-        fake_loss = self._discriminator.train_on_batch(generated_imgs, [fake_smooth, rand_labels])
-        total_loss = real_loss[0] + fake_loss[0]
+        real_loss = self._discriminator.train_on_batch(batch_imgs, [y_real, batch_labels])
+        fake_loss = self._discriminator.train_on_batch(generated_imgs, [y_fake, rand_labels])
+        #total_loss = real_loss[0] + fake_loss[0]
 
-        return .5 * float(total_loss)
+        # Want generated and real to be counted equally
+        #disc_real_weight = np.ones(2 * len(batch_imgs))
+        # We want to focus more on the real images
+        #disc_aux_weight = np.concatenate((1.5* np.ones(len(batch_imgs)), .5 * np.ones(len(batch_imgs))))
+                              
+        #total_loss = self._discriminator.train_on_batch(baz, [foo, bar], sample_weight=[disc_real_weight, disc_aux_weight])
+
+        #return float(total_loss[0])
+        return real_loss, fake_loss
 
 
     def _train_generator_batch(self, batch_size):
@@ -202,17 +212,16 @@ class Acgan:
 
         :return loss
         """
-        # Generate noise & random labels
         # Do 2 * batch_size to get the same # as discriminator (which is real+fake so do 2*fake)
-        noise = np.random.normal(0, 1, (2 * batch_size, self._noise_dim))
+        noise = self._generate_noise(2 * batch_size)
         rand_labels = np.random.randint(0, self._num_classes, 2 * batch_size)
 
         # Since they are actually fake we are attempting to 'Trick' the model
-        label_smooth = np.random.uniform(*self._label_smoothing[1], batch_size*2)
+        trick = np.ones(2* batch_size)
 
         # Generator take noise & associated random labels
         # The discriminator should then hpefully guess they are real with the correct label
-        gen_loss = self._combined_model.train_on_batch([noise, rand_labels], [label_smooth, rand_labels])
+        gen_loss = self._combined_model.train_on_batch([noise, rand_labels], [trick, rand_labels])
 
         return gen_loss
 
@@ -229,20 +238,34 @@ class Acgan:
         """
         # We'll record the training for every epoch
         # For testing we'll note the epoch and if it's the final one
-        loss_history = {'d_train': [], 'g_train': [], 'd_test': {}, 'g_test': {}}
-        checkpoints = [i for i in range(25, epochs+1, 25)]
+        #loss_history = {'d_train': [], 'g_train': [], 'd_test': {}, 'g_test': {}}
+        loss_history = {'real_gen': [], 'fake_gen': [], 'real_cls': [], 'fake_cls': [],
+                        'd_train': [], 'g_train': [], 'd_test': {}, 'g_test': {}}
+
+        checkpoints = [i for i in range(int(epochs/4), epochs+int(epochs/4), int(epochs/4))]
 
         for epoch in range(1, epochs+1):
             epoch_gen_loss = []
             epoch_disc_loss = []
+            intra_loss = {'real_cls': [], 'fake_cls': [], 'real_gen': [], 'fake_gen': []}
 
             for batch in trange(steps_per_epoch, desc=f"Training Epoch {epoch}/{epochs}"):
-                epoch_disc_loss.append(self._train_discriminator_batch(batch_size, batch_num=batch))
+                r, f = self._train_discriminator_batch(batch_size, batch_num=batch)
+                
+                intra_loss['real_gen'].append(r[1])
+                intra_loss['real_cls'].append(r[2])
+                intra_loss['fake_gen'].append(f[1])
+                intra_loss['fake_cls'].append(f[2])
+                epoch_disc_loss.append(.5*(r[0]+f[0]))
+
+                #epoch_disc_loss.append(self._train_discriminator_batch(batch_size, batch_num=batch))
                 epoch_gen_loss.append(self._train_generator_batch(batch_size))
   
             loss_history['d_train'].append(float(np.mean(np.array(epoch_disc_loss))))
             loss_history['g_train'].append(float(np.mean(np.array(epoch_gen_loss))))
-
+            for key in intra_loss:
+                loss_history[key].append(float(np.mean(np.array(intra_loss[key]))))
+            
             print("Train Loss:", 
                   f"discriminator = {round(loss_history['d_train'][-1], 2)},", 
                   f"generator = {round(loss_history['g_train'][-1], 2)}")
@@ -272,7 +295,7 @@ class Acgan:
         :return The combined model of gen/disc
         """
         # We are optimizing the addition of both losses
-        self._discriminator.compile(loss=self._loss_function, optimizer=self._optimizer)
+        self._discriminator.compile(loss=self._loss_function, optimizer=self._disc_optimizer)
 
         # We define the input and the output for the generator
         noise = layers.Input(shape=(self._noise_dim,))
@@ -292,7 +315,7 @@ class Acgan:
         # The discriminator then ouputs if real and the predicted class
         combo = Model([noise, label], [is_real, pred_class])
 
-        combo.compile(loss=self._loss_function, optimizer=self._optimizer)
+        combo.compile(loss=self._loss_function, optimizer=self._gen_optimizer)
 
         return combo
 
@@ -312,31 +335,46 @@ class Acgan:
 
         :return The generator model
         """
-        # Divide by 16 since we upsample by a factor of 16 (2^4, 2=stride, 4=deconv layers)
-        initial_dims = (int(self._input_shape[0] / 4), int(self._input_shape[1] / 4), 768)
-
         model = Sequential()
+        
+        # Divide by 16 since we upsample by a factor of 16 (2^4, 2=stride, 4=deconv layers)
+        initial_dims = (int(self._input_shape[0] / 8), int(self._input_shape[1] / 8), 384)
 
-        model.add(layers.Dense(int(np.product(initial_dims)), kernel_initializer=self._weight_init, input_dim=self._noise_dim, activation='relu'))
+        model.add(layers.Dense(int(np.product(initial_dims)), input_dim=self._noise_dim, activation='relu'))
         model.add(layers.Reshape(initial_dims))
 
-        model.add(layers.Conv2DTranspose(384, (5,5), strides=1, padding='same', kernel_initializer=self._weight_init, activation='relu'))
-        model.add(layers.BatchNormalization())
+        #model.add(layers.Conv2DTranspose(384, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='relu'))
+        #model.add(layers.Dropout(0.5))
 
-        model.add(layers.Conv2DTranspose(256, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='relu'))
-        model.add(layers.BatchNormalization())
+        #############################
+        model.add(GaussianNoise(0.15))
+        #############################
 
-        model.add(layers.Conv2DTranspose(192, (5,5), strides=1, padding='same', kernel_initializer=self._weight_init, activation='relu'))
+        model.add(layers.Conv2DTranspose(192, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='relu'))
         model.add(layers.BatchNormalization())
+        #model.add(layers.Dropout(0.2))
 
-        model.add(layers.Conv2DTranspose(1, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='tanh'))
+        #############################
+        model.add(GaussianNoise(0.15))
+        #############################
+
+        model.add(layers.Conv2DTranspose(96, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='relu'))
+        model.add(layers.BatchNormalization())
+        #model.add(layers.Dropout(0.2))
+        
+        #############################
+        model.add(GaussianNoise(0.15))
+        #############################
+
+        model.add(layers.Conv2DTranspose(3, (5,5), strides=2, padding='same', kernel_initializer=self._weight_init, activation='tanh'))
 
         # Create both inputs for generator
         noise = layers.Input(shape=(self._noise_dim, ))
         img_class = layers.Input(shape=(1,))
 
         # Instead of one-hot encoding (think of a bow representation)
-        classifier = layers.Embedding(self._num_classes, self._noise_dim)(img_class)
+        classifier = layers.Embedding(self._num_classes, self._noise_dim, 
+                                      embeddings_initializer=self._weight_init)(img_class)
 
         # Element wise 
         # This combines the noise with the class label
@@ -356,7 +394,12 @@ class Acgan:
         """
         model = Sequential()
 
-        model.add(layers.Conv2D(16, (3, 3), strides=2, padding='same', kernel_initializer=self._weight_init, input_shape=self._input_shape))
+        ##########################################
+        model.add(GaussianNoise(0.2, input_shape=self._input_shape))
+        ##########################################
+
+        #model.add(layers.Conv2D(16, (3, 3), strides=2, padding='same', kernel_initializer=self._weight_init, input_shape=self._input_shape))
+        model.add(layers.Conv2D(16, (3, 3), strides=2, padding='same', kernel_initializer=self._weight_init))
         model.add(layers.LeakyReLU(0.2))
         model.add(layers.Dropout(0.5))
 
@@ -387,6 +430,10 @@ class Acgan:
 
         model.add(layers.Flatten())
 
+        ##########################################
+        #model.add(MinibatchDiscrimination(50, 30))
+        ##########################################
+
         img_dims = layers.Input(shape=self._input_shape)
 
         # Doing it this way allows us to generate answers for both seeing if fake & correct class
@@ -396,10 +443,21 @@ class Acgan:
         features = model(img_dims)
 
         # For both checking if fake & correct class
-        fake = layers.Dense(1, activation='sigmoid', kernel_initializer=self._weight_init, name='generation')(features)
-        classifier = layers.Dense(self._num_classes, kernel_initializer=self._weight_init, activation='softmax', name='classifier')(features)
+        fake = layers.Dense(1, activation='sigmoid', name='generation')(features)
+        classifier = layers.Dense(self._num_classes, activation='softmax', name='classifier')(features)
 
         return Model(img_dims, [fake, classifier])
+
+
+    def _generate_noise(self, num_imgs):
+        """
+        Generate noise for num of images 
+
+        :param num_labels: # of labels to generate
+
+        :return num of images
+        """
+        return np.random.normal(0, 1, (num_imgs, self._noise_dim))
 
 
     def _noisy_labels(self, labels, prob=.05):
@@ -414,7 +472,8 @@ class Acgan:
         for l in range(len(labels)):
             # When 0 (which expect `prob` % of time - then flip)
             if np.random.choice(np.arange(0, 2), p=[prob, 1-prob]) == 0:
-                labels[l] = np.absolute(1 - labels[l])
+                # If generated greated than True smooth label then generate for lower & vice-versa
+                labels[l] = 0 if labels[l] == self._label_smoothing else self._label_smoothing
 
         return np.array(labels)
 
@@ -454,7 +513,8 @@ class Acgan:
                 datum = next(self._train)
                 datum = datum[0][0], datum[1][0]
             else:
-                datum = self._train[0][batch_num*batch_size+i], self._train[1][batch_num*batch_size+i]
+                offset = batch_num*batch_size
+                datum = self._train[0][offset+i], self._train[1][offset+i]
 
             # Go from 0 to 1 -> -1 to 1
             imgs.append((datum[0] - 127.5) / 127.5)

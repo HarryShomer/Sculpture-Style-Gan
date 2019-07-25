@@ -3,9 +3,10 @@ Code for creating the model using ACGAN
 
 https://towardsdatascience.com/gangogh-creating-art-with-gans-8d087d8f74a1
 """
-from keras.datasets import mnist
+from keras.datasets import mnist, cifar10
 
 import os
+import sys
 import json
 import itertools
 import numpy as np
@@ -26,7 +27,7 @@ TRAIN_IMAGES = 2988
 TEST_IMAGES = 1005
 IMG_DIM = (128, 128)
 BATCH_SIZE = 100
-EPOCHS = 10
+EPOCHS = 100
 
 
 """
@@ -71,17 +72,18 @@ def generate_imgs(labels):
     gen = load_model(os.path.join(FILE_PATH, "..", "models/", "acgan_generator.h5"))
     class_indices = [i for i in range(10)]
 
-    noise = np.random.normal(0, 1, (len(labels), 100))
+    noise = np.random.normal(0, 1, (len(labels), 110))
     generated_images = gen.predict([noise, np.array(labels)])
 
     for i in range(len(generated_images)):
         fixed_img = (127.5 * (generated_images[i] + 1)).astype(np.uint8)   # From -1 to 1 to 0-255
-        img = Image.fromarray(fixed_img.reshape(28, 28))
+        img = Image.fromarray(fixed_img)
         img.save(os.path.join(FILE_PATH, "..", "generated_images/", f"image_{class_indices[i]}.png"))
 
 
 def plot_loss():
     """
+    Training & Testing Loss
     """
     with open(os.path.join(FILE_PATH, "..", "models/", "loss_history.json"), "r") as f:
         loss_history = json.load(f)
@@ -91,8 +93,12 @@ def plot_loss():
     ##############
     plt.figure()
 
-    plt.plot(np.arange(1, EPOCHS+1), loss_history['d_train'], label=f"discriminator")
-    plt.plot(np.arange(1, EPOCHS+1), loss_history['g_train'], label=f"generator")
+    #plt.plot(np.arange(1, EPOCHS+1), loss_history['d_train'], label=f"discriminator")
+    #plt.plot(np.arange(1, EPOCHS+1), loss_history['g_train'], label=f"generator")
+    plt.plot(np.arange(1, EPOCHS+1), loss_history['real_gen'], label=f"real_gen")
+    plt.plot(np.arange(1, EPOCHS+1), loss_history['fake_gen'], label=f"fake_gen")
+    plt.plot(np.arange(1, EPOCHS+1), loss_history['real_cls'], label=f"real_cls")
+    plt.plot(np.arange(1, EPOCHS+1), loss_history['fake_cls'], label=f"fake_cls")
 
     plt.title("Train Loss")
     plt.xlabel("Epoch #")
@@ -108,8 +114,8 @@ def plot_loss():
     d_test = [loss_history['d_test'][key] for key in loss_history['d_test']][:-1]
     g_test = [loss_history['g_test'][key] for key in loss_history['g_test']][:-1]
 
-    plt.plot([25, 50, 75, 100], d_test, label=f"discriminator")
-    plt.plot([25, 50, 75, 100], g_test, label=f"generator")
+    plt.plot([i for i in range(5, EPOCHS+5, 5)], d_test, label=f"discriminator")
+    plt.plot([i for i in range(5, EPOCHS+5, 5)], g_test, label=f"generator")
 
     plt.title("Test Loss")
     plt.xlabel("Epoch #")
@@ -119,56 +125,27 @@ def plot_loss():
 
 
 
-"""
-1. Increase batch                 --done but not tested
-2. Increase datagenerator params  
-3. Gaussian latent                --done but not tested
-4. Gaussian weight init           --done but not tested
-5. Better label smoothing         --done but not tested
-6. Noisy labels                   --done but not tested
-4. Generator Loss Function        -- Think I fixed
-5. Try on few classes (3???)
-"""
-
-
 def main():
-    (x_train, y_train), (x_test, y_test) = mnist.load_data()
-    x_train = (x_train.astype(np.float32) - 127.5) / 127.5
-    x_train = np.expand_dims(x_train, axis=-1)
+    (x_train, y_train), (x_test, y_test) = cifar10.load_data()
+    #x_train = np.expand_dims(x_train, axis=-1)
+    #x_test = np.expand_dims(x_test, axis=-1)
 
-    x_test = (x_test.astype(np.float32) - 127.5) / 127.5
-    x_test = np.expand_dims(x_test, axis=-1)
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "img":
+            generate_imgs(list(range(10)))
+        if sys.argv[1] == "plot":
+            plot_loss()
+        return 
 
-    generate_imgs(list(range(10)))
-    exit()
-
-
-    # TODO!!!!!!!!!!!!!!
-    #
-    # 1. Change the strides for the GENERATOR back to normal (each 2)
-    #
-    #
-    # 2. Change the amount we divide by in initial_dims back to 16
-    #
-    #   
-    # 3. Change the last conv2d back from 1 to 3
-    #
-
-    a = Acgan(10, [x_train, y_train], test_sets=[x_test, y_test], input_shape=(28, 28, 1), data_gen=False)
-
-    try:
-        results = a.train(len(x_train) // BATCH_SIZE, 
-                          epochs=EPOCHS, 
-                          batch_size=BATCH_SIZE,
-                          save_checkpoints=True,
-                          save_path=os.path.join(FILE_PATH, "..", "models/"))
-    except Exception as e:
-        print("[ERROR]: Writing to error Log")
-        with open("error_log.txt", "w") as f:
-            f.write(str(e))
+    a = Acgan(10, [x_train, y_train], test_sets=[x_test, y_test], input_shape=(32, 32, 3), data_gen=False)
+    results = a.train(len(x_train) // BATCH_SIZE, 
+                      epochs=EPOCHS, 
+                      batch_size=BATCH_SIZE,
+                      save_checkpoints=True,
+                      save_path=os.path.join(FILE_PATH, "..", "models/"))
 
     a.save_state(loss_history=results, path=os.path.join(FILE_PATH, "..", "models/"))
-    loss_history()
+    plot_loss()
     
 
 
